@@ -107,14 +107,6 @@ GO
 -- Stored Procedures
 --
 
-USE [Kinsail]
-GO
-
-SET ANSI_NULLS ON
-GO
-
-SET QUOTED_IDENTIFIER ON
-GO
 
 --=======================================================================
 -- ReserveSite
@@ -128,10 +120,11 @@ GO
 -- @Message OUTPUT variable will contain any error messages
 --
 -- Updated 9/29/2015 (JN):
---   - Added new BypassValidation parameter
---   - Added ability to pass in UniqueID=0 to generate a new ID
+--   Added new BypassValidation parameter
+--   Added new IsReserved parameter
+--   Added ability to pass in UniqueID = 0 to generate a new UniqueID
 --=======================================================================
-CREATE PROCEDURE [dbo].[ReserveSite]
+ALTER PROCEDURE [dbo].[ReserveSite]
 	@SiteID bigint, 
 	@StartDate date, 
 	@EndDate date,
@@ -139,6 +132,7 @@ CREATE PROCEDURE [dbo].[ReserveSite]
 	@CartTimeout int = 900,    --in seconds (900 = 15 mins)
 	@ValidateOnly bit = 0,     --if set to 1, will only perform validation and will skip creation of the reservation
 	@BypassValidation bit = 0, --if set to 1, will bypass business rule validation and force the creation of the reservation 
+	@IsReserved bit = 0,       --if set to 1, will automatically set the r.IsReserved column to 1 (normally this would be done via CompletePurchase on successful payment)
 	@Message varchar(160) = '' OUTPUT
 AS
 BEGIN
@@ -372,7 +366,7 @@ BEGIN
 			SCOPE_IDENTITY(), --ResourceID (from above)
 			1, --Quantity
 			GETDATE(), --DATEADD(SECOND, @CartTimeout, GETDATE()), --CartRefreshDateTime
-			0, --IsReserved
+			@IsReserved, --IsReserved
 			0, --Cancelled
 			'', --CookieID
 			NULL --Audit_ContactID
@@ -385,6 +379,7 @@ BEGIN
 	--this only works as long as ReservationID is 10 digits or less (as SPs can only return an INT this way, else use an OUTPUT param)
 	RETURN @ReservationID
 END
+GO
 
 
 -- Wrapped version of the ReserveSite SP which returns any output as a single result row 

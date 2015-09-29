@@ -107,6 +107,15 @@ GO
 -- Stored Procedures
 --
 
+USE [Kinsail]
+GO
+
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
 --=======================================================================
 -- ReserveSite
 -- Creates reservation records for a camp site for a given span of dates
@@ -117,14 +126,19 @@ GO
 --   Returns an integer >100 on success, representing the ReservationID
 -- 
 -- @Message OUTPUT variable will contain any error messages
+--
+-- Updated 9/29/2015 (JN):
+--   - Added new BypassValidation parameter
+--   - Added ability to pass in UniqueID=0 to generate a new ID
 --=======================================================================
-CREATE PROCEDURE dbo.ReserveSite
+CREATE PROCEDURE [dbo].[ReserveSite]
 	@SiteID bigint, 
 	@StartDate date, 
 	@EndDate date,
-	@UniqueID bigint,
-	@CartTimeout int = 900, --in seconds (900 = 15 mins)
-	@ValidateOnly bit = 0, --if set to 1, will only perform validation and will skip creation of the reservation
+	@UniqueID bigint,          --required, but can pass in 0 to have a UniqueID generated
+	@CartTimeout int = 900,    --in seconds (900 = 15 mins)
+	@ValidateOnly bit = 0,     --if set to 1, will only perform validation and will skip creation of the reservation
+	@BypassValidation bit = 0, --if set to 1, will bypass business rule validation and force the creation of the reservation 
 	@Message varchar(160) = '' OUTPUT
 AS
 BEGIN
@@ -135,13 +149,14 @@ BEGIN
 	--DECLARE @SiteID BIGINT = 715289
 	--DECLARE @StartDate DATETIME = '2015-04-20'
 	--DECLARE @EndDate DATETIME = '2015-04-24'
-	--DECLARE @UniqueID BIGINT
-	--DECLARE @CartTimeout int = 900 --in seconds (900 = 15 mins)
-	--DECLARE @ValidateOnly bit = 0 --if set to 1, will only perform validation and will skip creation of the reservation
+	--DECLARE @UniqueID BIGINT = 0       --required, but can pass in 0 to have a UniqueID generated
+	--DECLARE @CartTimeout int = 900     --in seconds (900 = 15 mins)
+	--DECLARE @ValidateOnly bit = 0      --if set to 1, will only perform validation and will skip creation of the reservation
+	--DECLARE @BypassValidation bit = 0, --if set to 1, will bypass business rule validation and force the creation of the reservation 
 	--DECLARE @Message varchar(100) = '' 
 	--SELECT @UniqueID = dbo.fGetUniqueID(RAND())
 
-	--parameter validation
+	--parameter validation -- cannot be bypassed
 	--valid StartDate provided?
 	IF (ISNULL(@StartDate, '') = '')
 	BEGIN
@@ -171,13 +186,19 @@ BEGIN
 	END
 
 	--valid UniqueID provided?
-	IF (ISNULL(@UniqueID, 0) <= 0)
+	IF (ISNULL(@UniqueID, -1) < 0)
 	BEGIN
-		SET @Message = 'Parameter @UniqueID is required and must be an integer greater than 0'
+		SET @Message = 'Parameter @UniqueID is required and must be an integer greater than 0 (or 0 to have one generated)'
 		RETURN 68
 	END
 
-	--UniqueID already in use?
+	--generate UniqueID if 0
+	IF (@UniqueID = 0)
+	BEGIN
+		SELECT @UniqueID = dbo.fGetUniqueID(RAND());
+	END
+
+	--UniqueID already in use by another reservation?
 	IF (SELECT COUNT(*) FROM Reservations WHERE UniqueID = @UniqueID) > 0
 	BEGIN
 		SET @Message = 'Reservation already exists for @UniqueID=' + CAST(@UniqueID AS varchar(30))
@@ -186,94 +207,98 @@ BEGIN
 
 	DECLARE @Result int = 0
 
-	--validate reservation meets business rules (using a single query), encoding any errors as a binary result code:
-	--   0 = meets all rules
-	--   1 = reservation duration doesn't meet minimum stay requirement
-	--   2 = reservation exceeds maximum weekend stay limit
-	--   4 = reservation duration exceeds maximum stay limit
-	--   8 = one or more days within the period are not on an active availability schedule
-	--   16 = reservation request does not fall within advanced reservation window
-	--   32 = site is not reservable
-	SELECT @Result =
-		CASE  --meets minimum stay requirement?
-			WHEN COUNT(*) >= MAX(ar.MinDurationDays) THEN 0
-			ELSE 1
-		END +
-		CASE  --meets maximum weekend limit?
-			WHEN SUM(1 * IsResvWeekend) <= MIN(ISNULL(ar.MaxDurationWeekends, 999)) THEN 0
-			ELSE 2
-		END +
-		CASE  --meets maximum stay limit?
-			WHEN COUNT(*) <= MIN(ar.MaxDurationDays) THEN 0
-			ELSE 4
-		END +
-		CASE  --all days on active availability schedule?
-			WHEN COUNT(*) = COUNT(ar.ItemID) THEN 0
-			ELSE 8
-		END +
-		CASE  --within advanced reservation window?
-			WHEN COUNT(*) = SUM(CASE 
-							    WHEN (DATEDIFF(DAY, GETDATE(), d.[Date]) BETWEEN ar.ReserveBeforeDays AND ar.AvailBeforeDays) THEN 1 
-							    ELSE 0 
-							END) THEN 0
-			ELSE 16
-		END +
-		(1 - MIN(ixf.Value)) * 32  --site is reservable?
-	 FROM Dates d
-	CROSS JOIN Items s
-	 LEFT JOIN ItemsXFeatures ixf ON s.ItemID = ixf.ItemID
-	 LEFT JOIN (SELECT ixar.ItemID, 
-				    dar.AvailID, dar.AvailStartDate, dar.AvailEndDate,
-				    a.AvailBeforeDays, a.ReserveBeforeDays, a.MinDurationDays, a.MaxDurationDays, 
-				    a.MaxDurationWeekends, a.BetweenStaysDays,
-				    r.RateID, r.BaseFee, r.DailyFee, r.WeekdayFee, r.WeekendFee, r.DepositBaseFee, r.DepositDailyFee,
-				    r.ProcessorBaseFee, r.ProcessorDailyFee, r.DepositPercent, r.ProcessorPercent
-			    FROM ItemsXAvailRates ixar
-			    JOIN Rates r 
-				 ON ixar.RateID = r.RateID
-			    JOIN DiscreteAvailabilityRanges dar 
-				 ON ixar.AvailID = dar.AvailID
-			    JOIN [Availability] a
-				 ON dar.AvailID = a.AvailID
-			 ) ar
-	   ON s.ItemID = ar.ItemID
-	  AND d.[Date] >= ar.AvailStartDate
-	  AND d.[Date] <= ar.AvailEndDate
-	WHERE s.ItemID = @SiteID
-	  AND ixf.FeatureID = (SELECT FeatureID FROM Features WHERE Name = 'Reservable')
-	  AND d.[Date] >= @StartDate
-	  AND d.[Date] < @EndDate
-	GROUP BY s.ItemID
-
-	--any validation failures?
-	IF (@Result > 1)
+	--business rule validation
+	IF (@BypassValidation = 0)
 	BEGIN
-		SELECT @Message = CASE
-			WHEN @Result >= 32 THEN 'Validation failed: site is not reservable'
-			WHEN @Result >= 16 THEN 'Validation failed: reservation request does not fall within advanced reservation window'
-			WHEN @Result >= 8  THEN 'Validation failed: one or more days within the period are not on an active availability schedule'
-			WHEN @Result >= 4  THEN 'Validation failed: reservation duration exceeds maximum stay limit'
-			WHEN @Result >= 2  THEN 'Validation failed: reservation exceeds maximum weekend stay limit'
-			WHEN @Result >= 1  THEN 'Validation failed: reservation duration doesn''t meet minimum stay requirement'
-			ELSE ''
+		--validate reservation meets business rules (using a single query), encoding any errors as a binary result code:
+		--   0 = meets all rules
+		--   1 = reservation duration doesn't meet minimum stay requirement
+		--   2 = reservation exceeds maximum weekend stay limit
+		--   4 = reservation duration exceeds maximum stay limit
+		--   8 = one or more days within the period are not on an active availability schedule
+		--   16 = reservation request does not fall within advanced reservation window
+		--   32 = site is not reservable
+		SELECT @Result =
+			CASE  --meets minimum stay requirement?
+				WHEN COUNT(*) >= MAX(ar.MinDurationDays) THEN 0
+				ELSE 1
+			END +
+			CASE  --meets maximum weekend limit?
+				WHEN SUM(1 * IsResvWeekend) <= MIN(ISNULL(ar.MaxDurationWeekends, 999)) THEN 0
+				ELSE 2
+			END +
+			CASE  --meets maximum stay limit?
+				WHEN COUNT(*) <= MIN(ar.MaxDurationDays) THEN 0
+				ELSE 4
+			END +
+			CASE  --all days on active availability schedule?
+				WHEN COUNT(*) = COUNT(ar.ItemID) THEN 0
+				ELSE 8
+			END +
+			CASE  --within advanced reservation window?
+				WHEN COUNT(*) = SUM(CASE 
+									WHEN (DATEDIFF(DAY, GETDATE(), d.[Date]) BETWEEN ar.ReserveBeforeDays AND ar.AvailBeforeDays) THEN 1 
+									ELSE 0 
+								END) THEN 0
+				ELSE 16
+			END +
+			(1 - MIN(ixf.Value)) * 32  --site is reservable?
+		 FROM Dates d
+		CROSS JOIN Items s
+		 LEFT JOIN ItemsXFeatures ixf ON s.ItemID = ixf.ItemID
+		 LEFT JOIN (SELECT ixar.ItemID, 
+						dar.AvailID, dar.AvailStartDate, dar.AvailEndDate,
+						a.AvailBeforeDays, a.ReserveBeforeDays, a.MinDurationDays, a.MaxDurationDays, 
+						a.MaxDurationWeekends, a.BetweenStaysDays,
+						r.RateID, r.BaseFee, r.DailyFee, r.WeekdayFee, r.WeekendFee, r.DepositBaseFee, r.DepositDailyFee,
+						r.ProcessorBaseFee, r.ProcessorDailyFee, r.DepositPercent, r.ProcessorPercent
+					FROM ItemsXAvailRates ixar
+					JOIN Rates r 
+					 ON ixar.RateID = r.RateID
+					JOIN DiscreteAvailabilityRanges dar 
+					 ON ixar.AvailID = dar.AvailID
+					JOIN [Availability] a
+					 ON dar.AvailID = a.AvailID
+				 ) ar
+		   ON s.ItemID = ar.ItemID
+		  AND d.[Date] >= ar.AvailStartDate
+		  AND d.[Date] <= ar.AvailEndDate
+		WHERE s.ItemID = @SiteID
+		  AND ixf.FeatureID = (SELECT FeatureID FROM Features WHERE Name = 'Reservable')
+		  AND d.[Date] >= @StartDate
+		  AND d.[Date] < @EndDate
+		GROUP BY s.ItemID
+
+		--any validation failures?
+		IF (@Result > 1)
+		BEGIN
+			SELECT @Message = CASE
+				WHEN @Result >= 32 THEN 'Validation failed: site is not reservable'
+				WHEN @Result >= 16 THEN 'Validation failed: reservation request does not fall within advanced reservation window'
+				WHEN @Result >= 8  THEN 'Validation failed: one or more days within the period are not on an active availability schedule'
+				WHEN @Result >= 4  THEN 'Validation failed: reservation duration exceeds maximum stay limit'
+				WHEN @Result >= 2  THEN 'Validation failed: reservation exceeds maximum weekend stay limit'
+				WHEN @Result >= 1  THEN 'Validation failed: reservation duration doesn''t meet minimum stay requirement'
+				ELSE ''
+			END
+			RETURN @Result
 		END
-		RETURN @Result
-	END
 
-	--already reserved within the requested date range?
-	IF EXISTS (SELECT rr.ResourceID, rr.ItemID, rr.ResourceName, rr.ResourceDescription, rr.StartDateTime, rr.EndDateTime, r.ReservationID, r.UniqueID, r.IsReserved, r.Cancelled, 
-			        --r.CartRefreshDateTime, GETDATE() AS Now, 
-			          1 - r.IsReserved AS Temp, CASE IsReserved WHEN 0 THEN DATEDIFF(MINUTE, GETDATE(), DATEADD(SECOND, rr.CartTimeoutSeconds, r.CartRefreshDateTime)) WHEN 1 THEN NULL END AS ExpiresMins
-			     FROM dbo.Reservations r
-			     JOIN dbo.ReservationResources rr ON rr.ResourceID = r.ResourceID
-			    WHERE rr.ItemID = @SiteID
-			      AND r.Cancelled = 0 --disregard those marked cancelled
-			      AND (r.IsReserved = 1 OR (r.CartRefreshDateTime > DATEADD(SECOND, -1 * rr.CartTimeoutSeconds, GETDATE()))) --only those fully reserved or those temporarily reserved and within the timerout period
-			      AND rr.StartDateTime <= @EndDate --only those that start before our reservation's endDate
-			      AND rr.EndDateTime >= @StartDate) --only those that end after our reservation's StartDate
-	BEGIN
-		SET @Message = 'Site is already reserved for one or more dates in the requested date range'
-		RETURN 70
+		--already reserved within the requested date range?
+		IF EXISTS (SELECT rr.ResourceID, rr.ItemID, rr.ResourceName, rr.ResourceDescription, rr.StartDateTime, rr.EndDateTime, r.ReservationID, r.UniqueID, r.IsReserved, r.Cancelled, 
+						--r.CartRefreshDateTime, GETDATE() AS Now, 
+						  1 - r.IsReserved AS Temp, CASE IsReserved WHEN 0 THEN DATEDIFF(MINUTE, GETDATE(), DATEADD(SECOND, rr.CartTimeoutSeconds, r.CartRefreshDateTime)) WHEN 1 THEN NULL END AS ExpiresMins
+					 FROM dbo.Reservations r
+					 JOIN dbo.ReservationResources rr ON rr.ResourceID = r.ResourceID
+					WHERE rr.ItemID = @SiteID
+					  AND r.Cancelled = 0 --disregard those marked cancelled
+					  AND (r.IsReserved = 1 OR (r.CartRefreshDateTime > DATEADD(SECOND, -1 * rr.CartTimeoutSeconds, GETDATE()))) --only those fully reserved or those temporarily reserved and within the timerout period
+					  AND rr.StartDateTime <= @EndDate --only those that start before our reservation's endDate
+					  AND rr.EndDateTime >= @StartDate) --only those that end after our reservation's StartDate
+		BEGIN
+			SET @Message = 'Site is already reserved for one or more dates in the requested date range'
+			RETURN 70
+		END
 	END
 
 	IF (@ValidateOnly = 1)
@@ -360,7 +385,7 @@ BEGIN
 	--this only works as long as ReservationID is 10 digits or less (as SPs can only return an INT this way, else use an OUTPUT param)
 	RETURN @ReservationID
 END
-GO
+
 
 -- Wrapped version of the ReserveSite SP which returns any output as a single result row 
 -- (What Kinsail platform typically wants)
